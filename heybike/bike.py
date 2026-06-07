@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
+import math
 import platform
 
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ from urllib import parse, request
 
 from bleak import AdvertisementData, BleakClient, BleakScanner, BLEDevice
 from Crypto.Cipher import AES
+
+logger = logging.getLogger(__name__)
 
 SERVICE_UUID = "86531001-43e6-47b7-9cb0-5fc21d4ae340"
 WRITE_UUID = "86531002-43e6-47b7-9cb0-5fc21d4ae340"
@@ -29,11 +33,20 @@ NOTIFICATION_START = 0x7B
 NOTIFICATION_END = 0x7D
 TOKEN_PREFIX = bytes([0x16, 0x5A, 0x01])
 TOKEN_FETCH_CLEAR = TOKEN_PREFIX + bytes(13)
+MPH_FACTOR = 0.62137
 
 
 class OpCode(IntEnum):
+    ICCID_FIRST = 0x20
+    ICCID_SECOND = 0x21
+    ICCID_FINAL = 0x22
+
     POWER = 0x31
     BASE_INFO = 0x38
+    MILEAGE = 0x39
+    IMEI_FIRST = 0xA0
+    IMEI_SECOND = 0xA1
+    MAX_SPEED = 0xE1
 
 
 @dataclass
@@ -62,6 +75,20 @@ def normalize_mac(value: str) -> str:
     if len(compact) == 12:
         return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
     return value.upper()
+
+
+def _ascii_clean(data: bytes) -> str:
+    return bytes(byte for byte in data if byte).decode("utf-8", errors="replace")
+
+
+def _u16be(data: bytes, offset: int = 4) -> int:
+    if len(data) <= offset + 1:
+        raise RuntimeError("response did not include a two-byte value")
+    return (data[offset] << 8) | data[offset + 1]
+
+
+def _round_half_up(value: float) -> int:
+    return int(math.floor(value + 0.5))
 
 
 def _pkcs7_unpad(data: bytes, block_size: int = AES.block_size) -> bytes:
@@ -210,6 +237,7 @@ class Heybike:
     password: str | None = None
     token: str | None = None
     _imei: str | None = None
+    _icc_id: str | None = None
     _ble_key: str | None = None
     _ble_token: bytes | None = None
     _hardware_version: int | None = None
@@ -355,7 +383,12 @@ class Heybike:
             raise RuntimeError(f"getBikeByBleMac returned no bleKey: {data}")
 
         self._ble_key = decrypt_server_ble_key(ble_key)
-        self._imei = str(bike.get("deIMEI") or bike.get("imei") or "")
+        found_imei = str(bike.get("deIMEI") or bike.get("imei") or "")
+        if not self._imei:
+            self._imei = found_imei
+        else:
+            logger.warning("The fetched IMEI doesn't match the stored value from the bike! %s vs %s",
+                           self._imei, found_imei)
         self.name = str(bike.get("bleName") or bike.get("tBleName") or "")
 
     @property
@@ -474,13 +507,13 @@ class Heybike:
 
         return self._hardware_version
 
-    async def iot_firmware_version(self) -> int:
+    async def get_iot_firmware_version(self) -> int:
         if self._iot_firmware_version is None:
             await self.get_base_info()
 
         return self._iot_firmware_version
 
-    async def protocol_version(self) -> int | None:
+    async def get_protocol_version(self) -> int | None:
         if self._protocol_version is None:
             await self.get_base_info()
 
@@ -494,6 +527,71 @@ class Heybike:
 
     async def get_power(self) -> bool:
         return (await self.get_base_info()).power_on
+
+    async def get_mileage(self) -> str:
+        response = await self.send_ble_command(OpCode.MILEAGE)
+        if len(response) < 8:
+            raise RuntimeError("mileage response did not include all expected fields")
+        return ",".join(str(byte) for byte in response[4:8])
+
+    async def get_max_speed(self, *, raw: bool = False) -> int:
+        response = await self.send_ble_command(OpCode.MAX_SPEED)
+        raw_value = _u16be(response)
+        if raw:
+            return raw_value
+
+        imei = self._imei or await self.get_imei()
+        if imei.startswith("86"):
+            return _round_half_up(raw_value / MPH_FACTOR)
+        return raw_value
+
+    async def set_max_speed(self, value: int, *, raw: bool = False) -> None:
+        if value < 0:
+            raise ValueError("max speed must be non-negative")
+
+        raw_value = value
+        if not raw:
+            imei = self._imei or await self.get_imei()
+            if imei.startswith("86"):
+                raw_value = _round_half_up(value * MPH_FACTOR)
+        if raw_value > 0xFFFF:
+            raise ValueError("max speed raw BLE value must fit in two bytes")
+
+        response = await self.send_ble_command(OpCode.MAX_SPEED, raw_value.to_bytes(2, "big"))
+        reported = _u16be(response)
+        if reported != raw_value:
+            raise RuntimeError(f"bike reported max-speed raw value {reported}, expected {raw_value}")
+
+    async def get_imei(self) -> str:
+        first = await self.send_ble_command(OpCode.IMEI_FIRST)
+        second = await self.send_ble_command(OpCode.IMEI_SECOND)
+        if len(first) < 12 or len(second) < 4:
+            raise RuntimeError("IMEI response did not include all expected fields")
+
+        second_len = min(second[3], 8)
+        found_imei = _ascii_clean(first[4:12] + second[4 : 4 + second_len])
+        if not self._imei:
+            self._imei = found_imei
+        else:
+            logger.warning("The fetched IMEI doesn't match the stored value from the APIs! %s vs %s",
+                           self._imei, found_imei)
+        return found_imei
+
+    async def get_icc_id(self) -> str:
+        if self._icc_id:
+            return self._icc_id
+
+        if not (self._imei or await self.get_imei()).startswith("86"):
+            raise NotImplementedError("This bike does not support this endpoint.")
+
+        first = await self.send_ble_command(OpCode.ICCID_FIRST)
+        second = await self.send_ble_command(OpCode.ICCID_SECOND)
+        final = await self.send_ble_command(OpCode.ICCID_FINAL)
+        if len(first) < 12 or len(second) < 12 or len(final) < 8:
+            raise RuntimeError("ICCID response did not include all expected fields")
+
+        self._icc_id = _ascii_clean(first[4:12] + second[4:12] + bytes(byte for byte in final[4:8] if byte))
+        return self._icc_id
 
     async def set_power(self, value: bool) -> None:
         """Set the bike power state."""
