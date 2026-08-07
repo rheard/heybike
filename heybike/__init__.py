@@ -1,7 +1,19 @@
-from .bike import BaseInfo, BikeColorInfo, BikeIdentityInfo, BikeModelInfo, Heybike, HeybikeApiError
+from .bike import (
+    AntiTheftInfo,
+    AutoLockInfo,
+    BaseInfo,
+    BikeColorInfo,
+    BikeIdentityInfo,
+    BikeModelInfo,
+    Heybike,
+    HeybikeApiError,
+    SignalGpsInfo,
+)
 from .firmware import FirmwareUpdate, FirmwareUpdateError
 
 __all__ = [
+    "AntiTheftInfo",
+    "AutoLockInfo",
     "BaseInfo",
     "BikeColorInfo",
     "BikeIdentityInfo",
@@ -10,4 +22,5 @@ __all__ = [
     "FirmwareUpdateError",
     "Heybike",
     "HeybikeApiError",
+    "SignalGpsInfo",
 ]

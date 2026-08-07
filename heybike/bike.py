@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import csv
+import datetime as dt
 import json
 import logging
 import os
@@ -55,15 +56,30 @@ class OpCode(IntEnum):
     ICCID_FIRST = 0x20
     ICCID_SECOND = 0x21
     ICCID_FINAL = 0x22
-    IMEI_FIRST = 0xA0
-    IMEI_SECOND = 0xA1
 
-    OTA_START = 0x35
     POWER = 0x31
+    RESET_TO_DEFAULT = 0x32
+    RESET_TRIP_DISTANCE = 0x34
+    OTA_START = 0x35
+    SYNC_TIME = 0x36
     BASE_INFO = 0x38
     MILEAGE = 0x39
+    HEADLIGHT = 0x42
+    RIDE_FEEL = 0x44
+    THROTTLE_SENSITIVITY = 0x49
+    IMEI_FIRST = 0xA0
+    IMEI_SECOND = 0xA1
+    SIGNAL_GPS = 0xD1
+    ANTI_THEFT = 0xD7
+    AUTO_LOCK = 0xD8
+    HANDLE_PWM = 0xDA
+    HANDLE_GEAR = 0xDB
+    SPEED_LIMITER_TYPE = 0xDC
+    PRESET_MODE = 0xDF
     MAX_SPEED = 0xE1
+    SPEED_UNIT = 0xE5
     VOLTAGE = 0xE6
+    DRIVE_GEAR = 0xE7
     START_GEAR = 0xEA
     BACKLIGHT_BRIGHTNESS = 0xEF
 
@@ -78,6 +94,27 @@ class BaseInfo:
     hardware_version: int
     iot_firmware_version: int
     protocol_version: int
+
+
+@dataclass(frozen=True)
+class SignalGpsInfo:
+    """Signal and GPS strength returned by the bike."""
+    signal_intensity: int
+    gps_signal: int
+
+
+@dataclass(frozen=True)
+class AntiTheftInfo:
+    """Anti-theft/fence status returned by the bike."""
+    enabled: bool
+    distance: int
+
+
+@dataclass(frozen=True)
+class AutoLockInfo:
+    """Auto-lock status and timeout returned by the bike."""
+    enabled: bool
+    time: int
 
 
 @dataclass(frozen=True)
@@ -246,6 +283,14 @@ def _u16be(data: bytes, offset: int = 4) -> int:
     if len(data) <= offset + 1:
         raise RuntimeError("response did not include a two-byte value")
     return (data[offset] << 8) | data[offset + 1]
+
+
+def _u16be_payload(value: int, name: str) -> bytes:
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    if value > 0xFFFF:
+        raise ValueError(f"{name} raw BLE value must fit in two bytes")
+    return value.to_bytes(2, "big")
 
 
 def _read_ble_key_cache(path: str | Path | None, mac: str) -> CachedBikeInfo | None:
@@ -1205,6 +1250,22 @@ class Heybike:
         """Get the bike's auto-lock status"""
         return (await self.get_base_info()).auto_lock_enabled
 
+    async def get_auto_lock_info(self) -> AutoLockInfo:
+        """Get the bike's auto-lock status and timeout"""
+        response = await self.send_ble_command(OpCode.AUTO_LOCK)
+        if len(response) <= 6:
+            raise RuntimeError("auto-lock response did not include all expected fields")
+
+        enabled = response[4] == 1
+        time = _u16be(response, 5)
+        return AutoLockInfo(enabled=enabled, time=time if enabled else 0)
+
+    async def set_auto_lock(self, enabled: bool, time: int = 0):  # ruff: ignore[boolean-type-hint-positional-argument]
+        """Set the bike's auto-lock status and timeout"""
+        enabled = bool(enabled)
+        payload = (b"\x01" if enabled else b"\x00") + _u16be_payload(time if enabled else 0, "auto-lock time")
+        await self.send_ble_command(OpCode.AUTO_LOCK, payload)
+
     async def get_mileage(self) -> str:
         """Get the bike's current mileage"""
         response = await self.send_ble_command(OpCode.MILEAGE)
@@ -1239,10 +1300,10 @@ class Heybike:
         first = await self.send_ble_command(OpCode.ICCID_FIRST)
         second = await self.send_ble_command(OpCode.ICCID_SECOND)
         final = await self.send_ble_command(OpCode.ICCID_FINAL)
-        if len(first) < 12 or len(second) < 12 or len(final) < 8:
+        if len(first) < 12 or len(second) < 12 or len(final) < 9:
             raise RuntimeError("ICCID response did not include all expected fields")
 
-        self._icc_id = _ascii_clean(first[4:12] + second[4:12] + bytes(byte for byte in final[4:8] if byte))
+        self._icc_id = _ascii_clean(first[4:12] + second[4:12] + bytes(byte for byte in final[4:9] if byte))
         return self._icc_id
 
     @cache
@@ -1276,10 +1337,61 @@ class Heybike:
 
         return BikeIdentityInfo.from_api(imei, data)
 
+    async def reset_to_default(self):
+        """Reset the bike's personalization settings to defaults"""
+        await self.send_ble_command(OpCode.RESET_TO_DEFAULT)
+
+    async def reset_trip_distance(self):
+        """Reset the bike's trip distance"""
+        await self.send_ble_command(OpCode.RESET_TRIP_DISTANCE)
+
+    async def sync_controller_time(self, when: dt.datetime | None = None):
+        """Sync the bike controller time from the local clock"""
+        when = when or dt.datetime.now()
+        payload = bytes([
+            when.second,
+            when.minute,
+            when.hour,
+            when.day,
+            when.month,
+            when.isoweekday() % 7,
+            when.year & 0xFF,
+            (when.year >> 8) & 0xFF,
+        ])
+        await self.send_ble_command(OpCode.SYNC_TIME, payload)
+
+    async def get_signal_gps(self) -> SignalGpsInfo:
+        """Get the bike's cellular signal and GPS signal levels"""
+        response = await self.send_ble_command(OpCode.SIGNAL_GPS)
+        if len(response) <= 5:
+            raise RuntimeError("signal/GPS response did not include all expected fields")
+        return SignalGpsInfo(signal_intensity=response[4], gps_signal=response[5])
+
+    async def get_anti_theft(self) -> AntiTheftInfo:
+        """Get the bike's anti-theft/fence status"""
+        response = await self.send_ble_command(OpCode.ANTI_THEFT)
+        if len(response) <= 6:
+            raise RuntimeError("anti-theft response did not include all expected fields")
+        return AntiTheftInfo(enabled=response[4] == 1, distance=_u16be(response, 5))
+
+    async def set_anti_theft(
+        self,
+        enabled: bool,  # ruff: ignore[boolean-type-hint-positional-argument]
+        distance: int = 0,
+    ):
+        """Set the bike's anti-theft/fence status"""
+        enabled = bool(enabled)
+        payload = (b"\x01" if enabled else b"\x00") + _u16be_payload(distance if enabled else 0, "anti-theft distance")
+        await self.send_ble_command(OpCode.ANTI_THEFT, payload)
+
     async def get_max_speed(self) -> int:
         """Get the bike's max speed"""
+        imei = self._imei or await self.get_imei()
         response = await self.send_ble_command(OpCode.MAX_SPEED)
-        return _u16be(response)
+        raw_value = _u16be(response)
+        if imei.startswith("86"):
+            return int(raw_value / MPH_FACTOR + 0.5)
+        return raw_value
 
     async def set_max_speed(self, value: int):
         """Set the bike's max speed"""
@@ -1287,13 +1399,135 @@ class Heybike:
             raise ValueError("max speed must be non-negative")
 
         raw_value = value
-        if raw_value > 0xFFFF:
-            raise ValueError("max speed raw BLE value must fit in two bytes")
+        if (self._imei or await self.get_imei()).startswith("86"):
+            raw_value = int(value * MPH_FACTOR + 0.5)
 
-        response = await self.send_ble_command(OpCode.MAX_SPEED, raw_value.to_bytes(2, "big"))
+        response = await self.send_ble_command(OpCode.MAX_SPEED, _u16be_payload(raw_value, "max speed"))
         reported = _u16be(response)
         if reported != raw_value:
             raise RuntimeError(f"bike reported max-speed raw value {reported}, expected {raw_value}")
+
+    async def get_speed_unit(self) -> int:
+        """Get the bike's speed unit"""
+        response = await self.send_ble_command(OpCode.SPEED_UNIT)
+        return _u16be(response)
+
+    async def set_speed_unit(self, value: int):
+        """Set the bike's speed unit, where 0 is km and 1 is mile"""
+        if value not in (0, 1):
+            raise ValueError("speed unit must be 0 for km or 1 for mile")
+        await self.send_ble_command(OpCode.SPEED_UNIT, _u16be_payload(value, "speed unit"))
+
+    async def get_voltage_level(self) -> int:
+        """Get the bike's voltage level"""
+        response = await self.send_ble_command(OpCode.VOLTAGE)
+        return _u16be(response)
+
+    async def get_drive_gear(self) -> int:
+        """Get the bike's drive gear"""
+        response = await self.send_ble_command(OpCode.DRIVE_GEAR)
+        return _u16be(response)
+
+    async def set_drive_gear(self, value: int):
+        """Set the bike's drive gear"""
+        await self.send_ble_command(OpCode.DRIVE_GEAR, _u16be_payload(value, "drive gear"))
+
+    async def get_start_gear(self) -> int:
+        """Get the bike's start gear"""
+        response = await self.send_ble_command(OpCode.START_GEAR)
+        return _u16be(response)
+
+    async def set_start_gear(self, value: int):
+        """Set the bike's start gear"""
+        await self.send_ble_command(OpCode.START_GEAR, _u16be_payload(value, "start gear"))
+
+    async def get_backlight_brightness(self) -> int:
+        """Get the bike's backlight brightness"""
+        response = await self.send_ble_command(OpCode.BACKLIGHT_BRIGHTNESS)
+        value = _u16be(response)
+        return value - 4 if value > 4 else value
+
+    async def set_backlight_brightness(self, value: int):
+        """Set the bike's backlight brightness"""
+        if value < 0:
+            raise ValueError("backlight brightness must be non-negative")
+        raw_value = 4 if value == 0 else value + 4 if value < 4 else min(value, 6)
+        await self.send_ble_command(OpCode.BACKLIGHT_BRIGHTNESS, _u16be_payload(raw_value, "backlight brightness"))
+
+    async def get_handle_pwm(self) -> tuple[int, int, int, int, int]:
+        """Get the bike's handle PWM values"""
+        response = await self.send_ble_command(OpCode.HANDLE_PWM)
+        if len(response) <= 8:
+            raise RuntimeError("handle PWM response did not include all expected fields")
+        return response[4], response[5], response[6], response[7], response[8]
+
+    async def set_handle_pwm(self, values: bytes | bytearray | tuple[int, ...] | list[int]):
+        """Set the bike's handle PWM values"""
+        payload = bytes(values)
+        if len(payload) != 5:
+            raise ValueError("handle PWM must include exactly five values")
+        await self.send_ble_command(OpCode.HANDLE_PWM, payload)
+
+    async def get_handle_gear(self) -> int:
+        """Get the bike's handle gear"""
+        response = await self.send_ble_command(OpCode.HANDLE_GEAR)
+        return _u16be(response)
+
+    async def set_handle_gear(self, value: int):
+        """Set the bike's handle gear"""
+        await self.send_ble_command(OpCode.HANDLE_GEAR, _u16be_payload(value, "handle gear"))
+
+    async def get_speed_limiter_type(self) -> int:
+        """Get the bike's speed limiter type"""
+        response = await self.send_ble_command(OpCode.SPEED_LIMITER_TYPE)
+        return _u16be(response)
+
+    async def set_speed_limiter_type(self, value: int):
+        """Set the bike's speed limiter type, where 0 is both, 1 is PAS, and 2 is throttle"""
+        if value not in (0, 1, 2):
+            raise ValueError("speed limiter type must be 0 for both, 1 for PAS, or 2 for throttle")
+        await self.send_ble_command(OpCode.SPEED_LIMITER_TYPE, _u16be_payload(value, "speed limiter type"))
+
+    async def get_ride_feel(self) -> int:
+        """Get the bike's ride feel"""
+        response = await self.send_ble_command(OpCode.RIDE_FEEL)
+        return _u16be(response)
+
+    async def set_ride_feel(self, value: int):
+        """Set the bike's ride feel"""
+        await self.send_ble_command(OpCode.RIDE_FEEL, _u16be_payload(value, "ride feel"))
+
+    async def get_preset_mode(self) -> int:
+        """Get the bike's preset mode"""
+        response = await self.send_ble_command(OpCode.PRESET_MODE)
+        if len(response) <= 4:
+            raise RuntimeError("preset mode response did not include all expected fields")
+        return response[4]
+
+    async def set_preset_mode(self, value: int):
+        """Set the bike's preset mode"""
+        if value not in (1, 2, 3):
+            raise ValueError("preset mode must be 1, 2, or 3")
+        await self.send_ble_command(OpCode.PRESET_MODE, bytes([value]))
+
+    async def get_throttle_sensitivity(self) -> int:
+        """Get the bike's throttle sensitivity"""
+        response = await self.send_ble_command(OpCode.THROTTLE_SENSITIVITY)
+        return _u16be(response)
+
+    async def set_throttle_sensitivity(self, value: int):
+        """Set the bike's throttle sensitivity"""
+        await self.send_ble_command(OpCode.THROTTLE_SENSITIVITY, _u16be_payload(value, "throttle sensitivity"))
+
+    async def get_headlight(self) -> bool:
+        """Get the bike's headlight state"""
+        response = await self.send_ble_command(OpCode.HEADLIGHT)
+        return _u16be(response) == 1
+
+    async def set_headlight(self, value: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
+        """Set the bike's headlight state"""
+        value = bool(value)
+        await self.send_ble_command(OpCode.HEADLIGHT, _u16be_payload(1 if value else 0, "headlight"))
 
     async def get_power(self) -> bool:
         """Get the bike power state"""
