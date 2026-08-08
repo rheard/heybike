@@ -1266,12 +1266,12 @@ class Heybike:
         payload = (b"\x01" if enabled else b"\x00") + _u16be_payload(time if enabled else 0, "auto-lock time")
         await self.send_ble_command(OpCode.AUTO_LOCK, payload)
 
-    async def get_mileage(self) -> str:
-        """Get the bike's current mileage"""
+    async def get_mileage(self) -> float:
+        """Get the bike's current mileage in miles."""
         response = await self.send_ble_command(OpCode.MILEAGE)
         if len(response) < 8:
             raise RuntimeError("mileage response did not include all expected fields")
-        return ",".join(str(byte) for byte in response[4:8])
+        return int.from_bytes(response[4:8], "big") * MPH_FACTOR
 
     async def get_imei(self) -> str:
         """Get the bike's IMEI"""
