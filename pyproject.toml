@@ -31,6 +31,9 @@ test = [
     "pylint",
 ]
 
+[tool.setuptools.packages.find]
+include = ['heybike']
+
 [project.urls]
 Repository = "https://github.com/rheard/heybike"
 

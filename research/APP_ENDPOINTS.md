@@ -165,7 +165,6 @@ See `ENDPOINT_AUTHORIZATION_REVIEW.md` for the IDOR-focused pass over client-sup
 | 649 | POST | `appBikeApi/comment/publish` | body: CommentPublishBody {commentContent, commentId, contentId, token} | `CommentPublishInfo` | body token |
 | 654 | POST | `appHeyApi/getUserShopInfo` | form: token | `RespCollectedStore` | token field |
 | 658 | POST | `appBikeApi/ridingMoments/detail` | body: TokenBody {id, token} | `MomentsDetailInfo` | body token |
-
 | 581 | POST | `appHeyApi/getAllBikeType` | form: token | `BikeModelTypeList` | token field |
 | 222 | POST | `appHeyApi/getAllBikeColorType` | form: token, deType | `BikeColorInfo` | token field |
 
