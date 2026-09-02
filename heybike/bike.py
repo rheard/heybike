@@ -203,7 +203,7 @@ class BikeModelInfo:
     small_image_url: str = ""
     side_image_url: str = ""
     instruction_url: str = ""
-    colors: list[BikeColorInfo] = field(default_factory=dict, compare=False)
+    colors: list[BikeColorInfo] = field(default_factory=list, compare=False)
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -1306,7 +1306,6 @@ class Heybike:
         self._icc_id = _ascii_clean(first[4:12] + second[4:12] + bytes(byte for byte in final[4:9] if byte))
         return self._icc_id
 
-    @cache
     async def bike_info_by_imei(
         self,
         *,

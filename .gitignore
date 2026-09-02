@@ -5,5 +5,6 @@ build/
 dist/
 *.egg-info/
 *.log
-*.pyd
 *.pyproj
+__pycache__/
+*.py[cod]

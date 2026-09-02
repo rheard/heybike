@@ -1,7 +1,8 @@
 [project]
 name = "heybike"
 version = "0.0.1"
-dynamic = ["license"]
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name="Ryan Heard", email="ryanwheard@gmail.com" },
 ]
@@ -42,7 +43,7 @@ addopts = "--import-mode=importlib"
 
 [tool.ruff]
 line-length = 120
-extend-exclude=[]
+extend-exclude=["research"]
 exclude = [".venv", "*.pyi"]
 
 [tool.ruff.lint]
